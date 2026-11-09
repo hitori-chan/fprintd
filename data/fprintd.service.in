@@ -13,7 +13,7 @@ ProtectKernelTunables=true
 ProtectKernelLogs=true
 ProtectControlGroups=true
 # This always corresponds to /var/lib/fprint
-StateDirectory=fprint
+StateDirectory=fprint libfprint
 StateDirectoryMode=0700
 ProtectHome=true
 PrivateTmp=true
@@ -41,6 +41,8 @@ DeviceAllow=char-usb_device rw
 DeviceAllow=char-spi rw
 DeviceAllow=char-hidraw rw
 DeviceAllow=/dev/cros_fp rw
+# Apple Touch ID through the SEP (libfprint apple_sep, its records in /var/lib/libfprint)
+DeviceAllow=/dev/apple-sep-bio rw
 
 # Allow tuning USB parameters (wakeup and persist)
 ReadWritePaths=/sys/devices

@@ -45,6 +45,12 @@
 #include <signal.h>
 #include <sys/signalfd.h>
 #include <poll.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #endif
 
 #define PAM_SM_AUTH
@@ -80,10 +86,21 @@
 #define DEBUG_MATCH "debug="
 #define MAX_TRIES_MATCH "max-tries="
 #define TIMEOUT_MATCH "timeout="
+#define CONCURRENT_MATCH "concurrent"
 
 static bool debug = false;
 static unsigned max_tries = DEFAULT_MAX_TRIES;
 static unsigned timeout = DEFAULT_TIMEOUT;
+static bool concurrent = false;
+
+/* The concurrent mode's verify thread: the application's conversation belongs to the password prompt, which the
+ * main thread holds with no text of its own. The prompt is one line on the session's terminal, redrawn in place:
+ * "Password: ", "Fingerprint or password: " while the sensor waits for a finger (fprintd's finger-needed), the last
+ * message (a no-match, a retry) before it. Other messages are only logged. */
+static __thread bool conv_quiet = false;
+static __thread int conv_tty = -1;
+static __thread bool conv_armed = false;
+static __thread char conv_note[160];
 
 #define USEC_PER_SEC ((uint64_t) 1000000ULL)
 #define NSEC_PER_USEC ((uint64_t) 1000ULL)
@@ -111,6 +128,21 @@ str_has_prefix (const char *s, const char *prefix)
   return strncmp (s, prefix, strlen (prefix)) == 0;
 }
 
+static void
+concurrent_redraw (void)
+{
+  if (conv_tty < 0)
+    return;
+  dprintf (conv_tty, "\r\033[K%s%s%s", conv_note, conv_note[0] ? ". " : "",
+           conv_armed ? _("Fingerprint or password: ") : _("Password: "));
+}
+
+static void
+concurrent_note (const char *msg)
+{
+  snprintf (conv_note, sizeof (conv_note), "%s", msg ? msg : "");
+}
+
 static bool
 send_msg (pam_handle_t *pamh, const char *msg, int style)
 {
@@ -121,6 +153,21 @@ send_msg (pam_handle_t *pamh, const char *msg, int style)
   const struct pam_message *msgp = &mymsg;
   const struct pam_conv *pc;
   struct pam_response *resp;
+
+  if (conv_quiet)
+    {
+      /* the application's read keeps what was typed (its echo is off): only the prompt line changes */
+      if (style == PAM_ERROR_MSG)
+        {
+          concurrent_note (msg);
+          concurrent_redraw ();
+        }
+      else if (debug)
+        {
+          pam_syslog (pamh, LOG_DEBUG, "Not shown during the password prompt: %s", msg);
+        }
+      return true;
+    }
 
   if (pam_get_item (pamh, PAM_CONV, (const void **) &pc) != PAM_SUCCESS)
     return false;
@@ -219,11 +266,22 @@ typedef struct
   pam_handle_t *pamh;
 
   char         *driver;
+
+  /* concurrent mode: the main thread's stop (an eventfd), the session's terminal, and the verify thread's result */
+  bool          concurrent;
+  int           stop_fd;
+  int           tty_fd;
+  sd_bus       *bus;
+  atomic_bool   prompt_done;
+  int           thread_ret;
 } verify_data;
 
 static void
 verify_data_free (verify_data *data)
 {
+  /* the autoptr cleanup passes NULL when do_auth returns before its calloc */
+  if (!data)
+    return;
   free (data->result);
   free (data->driver);
   free (data->dev);
@@ -326,6 +384,53 @@ verify_finger_selected (sd_bus_message *m,
   return 0;
 }
 
+/* concurrent: fprintd's finger-needed, true while the sensor waits for a finger. The prompt offers the finger only
+ * then: after a restart (the password comes first) or past its tries it never comes, and the prompt stays the
+ * password's. */
+static int
+finger_needed_changed (sd_bus_message *m,
+                       void           *userdata,
+                       sd_bus_error   *ret_error)
+{
+  verify_data *data = userdata;
+  const char *iface = NULL;
+  const char *name = NULL;
+  int needed = 0;
+
+  if (!data->concurrent || atomic_load (&data->prompt_done))
+    return 0;
+  if (sd_bus_message_read_basic (m, 's', &iface) < 0 || !str_equal (iface, "net.reactivated.Fprint.Device"))
+    return 0;
+  if (sd_bus_message_enter_container (m, 'a', "{sv}") < 0)
+    return 0;
+  while (sd_bus_message_enter_container (m, 'e', "sv") > 0)
+    {
+      if (sd_bus_message_read_basic (m, 's', &name) < 0)
+        return 0;
+      if (str_equal (name, "finger-needed"))
+        {
+          if (sd_bus_message_read (m, "v", "b", &needed) < 0)
+            return 0;
+          if (needed && !conv_armed)
+            {
+              conv_armed = true;
+              concurrent_redraw ();
+            }
+          else if (!needed)
+            {
+              conv_armed = false;
+            }
+        }
+      else if (sd_bus_message_skip (m, "v") < 0)
+        {
+          return 0;
+        }
+      if (sd_bus_message_exit_container (m) < 0)
+        return 0;
+    }
+  return 0;
+}
+
 /* See https://github.com/systemd/systemd/issues/14636 */
 static int
 get_property_string (sd_bus       *bus,
@@ -415,6 +520,7 @@ do_verify (sd_bus      *bus,
 {
   pf_autoptr (sd_bus_slot) verify_status_slot = NULL;
   pf_autoptr (sd_bus_slot) verify_finger_selected_slot = NULL;
+  pf_autoptr (sd_bus_slot) finger_needed_slot = NULL;
   pf_autofree char *scan_type = NULL;
 #ifdef __linux__
   sigset_t signals;
@@ -461,6 +567,16 @@ do_verify (sd_bus      *bus,
                        verify_result,
                        data);
 
+  if (data->concurrent)
+    sd_bus_match_signal (bus,
+                         &finger_needed_slot,
+                         "net.reactivated.Fprint",
+                         data->dev,
+                         "org.freedesktop.DBus.Properties",
+                         "PropertiesChanged",
+                         finger_needed_changed,
+                         data);
+
   sd_bus_match_signal (bus,
                        &verify_finger_selected_slot,
                        "net.reactivated.Fprint",
@@ -480,7 +596,8 @@ do_verify (sd_bus      *bus,
     {
       uint64_t verification_end = ULONG_MAX;
 
-      if (timeout != UINT_MAX)
+      /* concurrent: the finger stays usable for as long as the password prompt waits */
+      if (timeout != UINT_MAX && !data->concurrent)
         verification_end = now () + (timeout * USEC_PER_SEC);
 
       data->timed_out = false;
@@ -533,6 +650,21 @@ do_verify (sd_bus      *bus,
               /* The only way for this to happen is if we received SIGINT. */
               return PAM_AUTHINFO_UNAVAIL;
             }
+
+          if (data->stop_fd >= 0)
+            {
+              uint64_t stop;
+
+              if (read (data->stop_fd, &stop, sizeof (stop)) == sizeof (stop))
+                {
+                  if (debug)
+                    pam_syslog (data->pamh, LOG_DEBUG, "The password prompt returned: stopping the verify");
+                  (void) sd_bus_call_method (bus, "net.reactivated.Fprint", data->dev,
+                                             "net.reactivated.Fprint.Device", "VerifyStop",
+                                             NULL, NULL, NULL, NULL);
+                  return PAM_AUTHINFO_UNAVAIL;
+                }
+            }
 #endif
 
           r = sd_bus_process (bus, NULL);
@@ -547,9 +679,10 @@ do_verify (sd_bus      *bus,
           if (r == 0)
             {
 #ifdef __linux__
-              struct pollfd fds[2] = {
+              struct pollfd fds[3] = {
                 { sd_bus_get_fd (bus), sd_bus_get_events (bus), 0 },
                 { signal_fd, POLLIN, 0 },
+                { data->stop_fd, POLLIN, 0 },
               };
 #endif
 
@@ -562,7 +695,7 @@ do_verify (sd_bus      *bus,
                 }
 
 #if defined(__linux__)
-              r = poll (fds, 2, wait_time / USEC_PER_MSEC);
+              r = poll (fds, 3, wait_time == INT64_MAX ? -1 : (int) (wait_time / USEC_PER_MSEC));
               if (r < 0 && errno != EINTR)
                 {
                   pam_syslog (data->pamh, LOG_ERR, "Error waiting for events: %d", errno);
@@ -757,12 +890,208 @@ name_owner_changed (sd_bus_message *m,
   return 0;
 }
 
+#ifdef __linux__
+/*
+ * The concurrent mode needs the application's password prompt to read the session's terminal: PAM_TTY must be the
+ * terminal on stdin (Linux-PAM's misc_conv reads stdin: login, su) or the controlling one (sudo reads /dev/tty), and
+ * the module must be root, since TIOCSTI into a terminal that is not the caller's controlling one needs
+ * CAP_SYS_ADMIN, as does any since Linux 6.2's dev.tty.legacy_tiocsti=0. login has no controlling terminal while it
+ * authenticates (its vhangup() drops it). A lock screen, a polkit agent or a greeter has no terminal.
+ */
+static bool
+same_terminal (int fd, const struct stat *st)
+{
+  struct stat o;
+
+  return fd >= 0 && isatty (fd) && fstat (fd, &o) == 0 && S_ISCHR (o.st_mode) && o.st_rdev == st->st_rdev;
+}
+
+static int
+open_session_tty (pam_handle_t *pamh)
+{
+  const char *tty = NULL;
+  pf_autofree char *path = NULL;
+  struct stat st;
+  bool ok;
+  int fd, ctty;
+
+  if (geteuid () != 0)
+    return -1;
+  if (pam_get_item (pamh, PAM_TTY, (const void **) (const void *) &tty) != PAM_SUCCESS || !tty || !*tty)
+    return -1;
+  if (asprintf (&path, "%s%s", str_has_prefix (tty, "/dev/") ? "" : "/dev/", tty) < 0)
+    return -1;
+
+  fd = open (path, O_RDWR | O_NOCTTY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  if (!isatty (fd) || fstat (fd, &st) != 0)
+    {
+      close (fd);
+      return -1;
+    }
+  ok = same_terminal (STDIN_FILENO, &st);
+  if (!ok)
+    {
+      ctty = open ("/dev/tty", O_RDWR | O_NOCTTY | O_CLOEXEC);
+      ok = same_terminal (ctty, &st);
+      if (ctty >= 0)
+        close (ctty);
+    }
+  if (!ok)
+    {
+      if (debug)
+        pam_syslog (pamh, LOG_DEBUG, "%s is neither stdin's terminal nor the controlling one: no concurrent prompt",
+                    path);
+      close (fd);
+      return -1;
+    }
+  return fd;
+}
+
+static void *
+verify_thread (void *d)
+{
+  verify_data *data = d;
+
+  conv_quiet = true;
+  conv_tty = data->tty_fd;
+  conv_armed = false;
+  concurrent_note (NULL);
+  data->thread_ret = do_verify (data->bus, data);
+
+  /* the finger done with while the prompt waits (its tries spent, or the device unusable: a restart's password
+   * first, an error): the prompt goes back to the password's, saying why when the tries ran out */
+  if (data->thread_ret != PAM_SUCCESS && !atomic_load (&data->prompt_done))
+    {
+      if (data->thread_ret == PAM_MAXTRIES)
+        concurrent_note (_("No more fingerprint tries"));
+      conv_armed = false;
+      concurrent_redraw ();
+    }
+
+  /* a match ends the password prompt as Enter would: the application's own read returns, its terminal restored by
+   * itself; whatever was typed is discarded */
+  if (data->thread_ret == PAM_SUCCESS && !atomic_load (&data->prompt_done))
+    {
+      const char nl = '\n';
+
+      if (ioctl (data->tty_fd, TIOCSTI, &nl) != 0)
+        pam_syslog (data->pamh, LOG_ERR, "Failed to end the password prompt (TIOCSTI): %d", errno);
+    }
+  return NULL;
+}
+
+/*
+ * The password prompt on the application's own thread and the fingerprint in a worker, whichever comes first:
+ * a match returns PAM_SUCCESS; a typed password becomes PAM_AUTHTOK for the next module (pam_unix try_first_pass)
+ * and this one returns PAM_IGNORE.
+ */
+static int
+do_concurrent (pam_handle_t *pamh, sd_bus *bus, verify_data *data, int tty_fd)
+{
+  pf_autofree char *pw = NULL;
+  pthread_t thread;
+  uint64_t one = 1;
+  int r;
+
+  data->concurrent = true;
+  data->bus = bus;
+  data->tty_fd = tty_fd;
+  /* the password's prompt first: the finger is offered once the sensor waits for it */
+  dprintf (tty_fd, "%s", _("Password: "));
+  data->stop_fd = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
+  if (data->stop_fd < 0 || pthread_create (&thread, NULL, verify_thread, data) != 0)
+    {
+      pam_syslog (pamh, LOG_ERR, "No verify thread (%d): the sequential flow", errno);
+      dprintf (tty_fd, "\r\033[K");
+      if (data->stop_fd >= 0)
+        close (data->stop_fd);
+      data->stop_fd = -1;
+      data->concurrent = false;
+      return do_verify (bus, data);
+    }
+
+  /* the application's prompt has no text: the line is this module's, drawn before the verify thread can redraw it */
+  r = pam_prompt (pamh, PAM_PROMPT_ECHO_OFF, &pw, "%s", "");
+  atomic_store (&data->prompt_done, true);
+  if (write (data->stop_fd, &one, sizeof (one)) != sizeof (one))
+    pam_syslog (pamh, LOG_ERR, "Failed to stop the verify thread: %d", errno);
+  pthread_join (thread, NULL);
+  close (data->stop_fd);
+  data->stop_fd = -1;
+
+  if (data->thread_ret == PAM_SUCCESS)
+    r = PAM_SUCCESS;
+  else if (r == PAM_SUCCESS)
+    {
+      if (pw && *pw)
+        r = pam_set_item (pamh, PAM_AUTHTOK, pw);
+      if (r == PAM_SUCCESS)
+        r = PAM_IGNORE;
+    }
+  if (pw)
+    explicit_bzero (pw, strlen (pw));
+  return r;
+}
+#endif
+
+/*
+ * The tries are the PAM handle's, not one authentication's: an application that asks again after a wrong password
+ * (login) reuses its handle, and a password attempt does not give the finger new tries, as macOS keeps Touch ID's
+ * count. Once they are spent the module stays out of that handle's prompts.
+ */
+#define TRIES_LEFT_DATA "pam_fprintd_tries_left"
+
+static void
+tries_left_free (pam_handle_t *pamh, void *data, int error_status)
+{
+  free (data);
+}
+
+static unsigned
+tries_left (pam_handle_t *pamh)
+{
+  const void *p = NULL;
+
+  if (pam_get_data (pamh, TRIES_LEFT_DATA, &p) == PAM_SUCCESS && p)
+    return *(const unsigned *) p;
+  return max_tries;
+}
+
+static void
+keep_tries_left (pam_handle_t *pamh, unsigned n)
+{
+  unsigned *p = malloc (sizeof (*p));
+
+  if (!p)
+    return;
+  *p = n;
+  if (pam_set_data (pamh, TRIES_LEFT_DATA, p, tries_left_free) != PAM_SUCCESS)
+    free (p);
+}
+
 static int
 do_auth (pam_handle_t *pamh, const char *username)
 {
   pf_autoptr (verify_data) data = NULL;
   pf_autoptr (sd_bus) bus = NULL;
   pf_autoptr (sd_bus_slot) name_owner_changed_slot = NULL;
+#ifdef __linux__
+  pf_auto (fd_int) tty_fd = -1;
+
+  /* concurrent only: without a terminal prompt (a lock screen, a polkit agent) this module stays out of the way,
+   * and such an application reaches fprintd itself */
+  if (concurrent && (tty_fd = open_session_tty (pamh)) < 0)
+    return PAM_IGNORE;
+#endif
+
+  if (tries_left (pamh) == 0)
+    {
+      if (debug)
+        pam_syslog (pamh, LOG_DEBUG, "No fingerprint tries left in this handle");
+      return PAM_AUTHINFO_UNAVAIL;
+    }
 
   if (!(data = calloc (1, sizeof (verify_data))))
     {
@@ -770,8 +1099,10 @@ do_auth (pam_handle_t *pamh, const char *username)
       return PAM_SYSTEM_ERR;
     }
 
-  data->max_tries = max_tries;
+  data->max_tries = tries_left (pamh);
   data->pamh = pamh;
+  data->stop_fd = -1;
+  data->tty_fd = -1;
 
   if (sd_bus_open_system (&bus) < 0)
     {
@@ -798,7 +1129,14 @@ do_auth (pam_handle_t *pamh, const char *username)
 
   if (claim_device (pamh, bus, data->dev, username))
     {
-      int ret = do_verify (bus, data);
+      int ret;
+#ifdef __linux__
+      if (tty_fd >= 0)
+        ret = do_concurrent (pamh, bus, data, tty_fd);
+      else
+#endif
+      ret = do_verify (bus, data);
+      keep_tries_left (pamh, data->max_tries);
 
       /* Simply disconnect from bus if we return PAM_SUCCESS */
       if (ret != PAM_SUCCESS)
@@ -881,6 +1219,10 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc,
                 {
                   pam_syslog (pamh, LOG_DEBUG, "invalid debug value '%s', disabling", value);
                 }
+            }
+          else if (str_equal (argv[i], CONCURRENT_MATCH))
+            {
+              concurrent = true;
             }
           else if (str_has_prefix (argv[i], MAX_TRIES_MATCH) && strlen (argv[i]) > strlen (MAX_TRIES_MATCH))
             {
