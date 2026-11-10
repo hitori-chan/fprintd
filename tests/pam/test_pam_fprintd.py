@@ -358,6 +358,55 @@ class TestPamFprintd(dbusmock.DBusTestCase):
         self.assertFalse(res.errors)
         self.assertFalse(res.info)
 
+    def test_pam_authsucc(self):
+        self.setup_device()
+        script = [
+            ( 'verify-match', True, 1 )
+        ]
+        self.device_mock.SetVerifyScript(script)
+
+        # The service's stack succeeds only when the module returns PAM_IGNORE;
+        # a verify would have matched (PAM_SUCCESS), and shown its prompt
+        tc = pypamtest.TestCase(pypamtest.PAMTEST_AUTHENTICATE, expected_rv=PAM_SUCCESS)
+        res = pypamtest.run_pamtest("toto", "fprintd-pam-test-authsucc", [tc], [ 'unused' ])
+        self.assertFalse(res.info)
+        self.assertFalse(res.errors)
+        self.assertEqual(self.device_mock.GetPasswordsAccepted(), ['toto'])
+
+        # Nothing was claimed nor started
+        with self.assertRaisesRegex(dbus.exceptions.DBusException, 'NoActionInProgress'):
+            self.device_mock.VerifyStop()
+        self.device_mock.Claim('toto')
+        self.device_mock.Release()
+
+    def test_pam_authsucc_every_device(self):
+        device_path = self.obj_fprintd_mock.AddDevice('FDO Sandpaper Reader', 3, 'press', False)
+        sandpaper_device_mock = self.dbus_con.get_object('net.reactivated.Fprint', device_path)
+        self.setup_device()
+
+        tc = pypamtest.TestCase(pypamtest.PAMTEST_AUTHENTICATE, expected_rv=PAM_SUCCESS)
+        res = pypamtest.run_pamtest("toto", "fprintd-pam-test-authsucc", [tc], [ 'unused' ])
+        self.assertFalse(res.info)
+        self.assertFalse(res.errors)
+        self.assertEqual(sandpaper_device_mock.GetPasswordsAccepted(), ['toto'])
+        self.assertEqual(self.device_mock.GetPasswordsAccepted(), ['toto'])
+
+    def test_pam_authsucc_ignores_errors(self):
+        self.setup_device()
+        self.device_mock.SetClaimed('someone')
+
+        tc = pypamtest.TestCase(pypamtest.PAMTEST_AUTHENTICATE, expected_rv=PAM_SUCCESS)
+        res = pypamtest.run_pamtest("toto", "fprintd-pam-test-authsucc", [tc], [ 'unused' ])
+        self.assertFalse(res.info)
+        self.assertFalse(res.errors)
+        self.assertEqual(self.device_mock.GetPasswordsAccepted(), [])
+
+    def test_pam_authsucc_no_device(self):
+        tc = pypamtest.TestCase(pypamtest.PAMTEST_AUTHENTICATE, expected_rv=PAM_SUCCESS)
+        res = pypamtest.run_pamtest("toto", "fprintd-pam-test-authsucc", [tc], [ 'unused' ])
+        self.assertFalse(res.info)
+        self.assertFalse(res.errors)
+
 if __name__ == '__main__':
     if 'PAM_WRAPPER_SERVICE_DIR' not in os.environ:
         print('Cannot run test without environment set correctly, run "meson test" instead')

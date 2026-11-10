@@ -472,6 +472,37 @@
 
 		<!-- ************************************************************ -->
 
+		<method name="PasswordAccepted">
+			<arg type="s" name="username" direction="in">
+				<doc:doc><doc:summary>The user whose password was accepted. See <doc:ref type="description" to="usernames">Usernames</doc:ref>.</doc:summary></doc:doc>
+			</arg>
+			<doc:doc>
+				<doc:description>
+					<doc:para>
+						Tell the device that the host has just accepted the chosen user's password, as pam_fprintd's
+						<doc:tt>authsucc</doc:tt> option does once the password modules before it succeeded. A device
+						that locks a user's matches out after too many failed ones, and is cleared by the user's
+						password on its own platform, clears that lockout (Apple's Touch ID through the SEP). On any
+						other device the call does nothing and succeeds.
+					</doc:para>
+					<doc:para>
+						The device need not be claimed: fprintd opens it for the call and closes it again. While it is
+						claimed, only the claiming client, or another connection of the same process (a lock screen's
+						PAM module beside its own fingerprint client), may call it, and only while no operation runs.
+						It needs the <doc:tt>net.reactivated.fprint.device.verify</doc:tt> PolicyKit action.
+					</doc:para>
+				</doc:description>
+
+				<doc:errors>
+					<doc:error name="&ERROR_PERMISSION_DENIED;">if the caller lacks the appropriate PolicyKit authorization</doc:error>
+					<doc:error name="&ERROR_ALREADY_IN_USE;">if another client claims the device, or an operation is in progress</doc:error>
+					<doc:error name="&ERROR_INTERNAL;">if the device could not be opened, or did not take it</doc:error>
+				</doc:errors>
+			</doc:doc>
+		</method>
+
+		<!-- ************************************************************ -->
+
 		<signal name="VerifyFingerSelected">
 			<arg type="s" name="finger_name">
 				<doc:doc>

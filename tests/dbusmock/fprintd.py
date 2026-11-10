@@ -138,6 +138,7 @@ def AddDevice(self, device_name, num_enroll_stages, scan_type,
     device.action = None
     device.selected_finger = None
     device.verify_script = []
+    device.passwords_accepted = []
 
     return path
 
@@ -335,6 +336,25 @@ def VerifyStop(device):
             name='net.reactivated.Fprint.Error.NoActionInProgress')
     device.action = None
     device.selected_finger = None
+
+@dbus.service.method(DEVICE_IFACE,
+                     in_signature='s', out_signature='')
+def PasswordAccepted(device, user):
+    if device.claimed_user or device.action:
+        raise dbus.exceptions.DBusException(
+            'Device already in use by %s' % device.claimed_user,
+            name='net.reactivated.Fprint.Error.AlreadyInUse')
+    device.passwords_accepted.append(user)
+
+@dbus.service.method(DEVICE_MOCK_IFACE,
+                     in_signature='', out_signature='as')
+def GetPasswordsAccepted(device):
+    '''Convenience method to get the users PasswordAccepted was called for
+
+    Returns the usernames, in the order of the calls.
+    '''
+
+    return device.passwords_accepted
 
 @dbus.service.method(DEVICE_IFACE,
                      in_signature='s', out_signature='')

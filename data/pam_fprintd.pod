@@ -6,6 +6,8 @@ pam_fprintd - PAM module to authenticate against fprintd, the fingerprint daemon
 
 B<pam_fprintd.so> [debug|debug=[I<on>|I<off>|I<true>|I<false>|I<1>|I<0>]] [max-tries=I<MAX_TRIES>] [timeout=I<TIMEOUT>]
 
+B<pam_fprintd.so> authsucc [debug]
+
 =head1 DESCRIPTION
 
 The pam_fprintd module is used to verify a user's fingerprints against fingerprints
@@ -37,6 +39,24 @@ is 30 seconds, with 1 second being the minimum.
 
 Use a negative value to set no limit at all, so that fingerprint authentication will
 be always active while this module is loaded.
+
+=item B<authsucc>
+
+The modules before this one have accepted the user's password: the module verifies
+no finger and shows no prompt, but tells each fingerprint reader that the password of
+the user (B<PAM_USER>) was accepted, through fprintd's B<PasswordAccepted> method. A
+reader that locks the user's matches out after too many failed ones clears that lockout,
+as the password does on its own platform (Apple's Touch ID through the Secure Enclave);
+other readers ignore it. Each call to fprintd gives up after 2 seconds, every error is
+ignored, and the module always returns B<PAM_IGNORE>. Remote logins are skipped.
+
+Like B<pam_faillock>'s B<authsucc>, the line goes in the B<auth> stack after the
+password modules, where a failed password never reaches it, for example in Arch Linux's
+F</etc/pam.d/system-auth> right after C<auth required pam_faillock.so authsucc>:
+
+    auth       optional                    pam_fprintd.so       authsucc
+
+A lock screen that only calls pam_authenticate(3) reaches it there too.
 
 =back
 

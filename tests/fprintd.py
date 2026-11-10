@@ -1498,6 +1498,42 @@ class FPrintdVirtualDeviceTest(FPrintdVirtualDeviceBaseTest):
 
         self.device.Release()
 
+    def test_password_accepted(self):
+        # A driver with no lockout of its own: nothing to do, no claim needed
+        self._polkitd_obj.SetAllowed([FprintDevicePermission.verify])
+        self.device.PasswordAccepted('(s)', '')
+        self.device.PasswordAccepted('(s)', self.get_current_user())
+
+        # Nothing stays claimed
+        self.device.Claim('(s)', '')
+        self.device.Release()
+
+    def test_unallowed_password_accepted(self):
+        self._polkitd_obj.SetAllowed([''])
+
+        with self.assertFprintError('PermissionDenied'):
+            self.device.PasswordAccepted('(s)', '')
+
+        self._polkitd_obj.SetAllowed([FprintDevicePermission.enroll])
+
+        with self.assertFprintError('PermissionDenied'):
+            self.device.PasswordAccepted('(s)', '')
+
+    def test_unallowed_password_accepted_other_user(self):
+        self._polkitd_obj.SetAllowed([FprintDevicePermission.verify])
+
+        with self.assertFprintError('PermissionDenied'):
+            self.device.PasswordAccepted('(s)', 'testuser')
+
+        self._polkitd_obj.SetAllowed([FprintDevicePermission.set_username])
+
+        with self.assertFprintError('PermissionDenied'):
+            self.device.PasswordAccepted('(s)', 'testuser')
+
+        self._polkitd_obj.SetAllowed([FprintDevicePermission.set_username,
+                                      FprintDevicePermission.verify])
+        self.device.PasswordAccepted('(s)', 'testuser')
+
     def test_unclaimed_release(self):
         with self.assertFprintError('ClaimDevice'):
             self.device.Release()
@@ -2285,6 +2321,28 @@ class FPrintdVirtualDeviceClaimedTest(FPrintdVirtualDeviceBaseTest):
     def test_verify_start_finger_from_other_client(self):
         with self.assertFprintError('AlreadyInUse'):
             self.call_device_method_from_other_client('VerifyStart', ['left-thumb'])
+
+    def test_password_accepted_claimed(self):
+        self.device.PasswordAccepted('(s)', 'testuser')
+
+    def test_password_accepted_claimed_same_process(self):
+        # A lock screen's PAM module beside its own fingerprint client
+        bus, dev = self.get_secondary_bus_and_device()
+        dev.PasswordAccepted('(s)', 'testuser')
+        bus.close_sync()
+
+    def test_password_accepted_from_other_client(self):
+        with self.assertFprintError('AlreadyInUse'):
+            self.call_device_method_from_other_client('PasswordAccepted', ['testuser'])
+
+    def test_password_accepted_during_verify(self):
+        self.enroll_image('whorl')
+        self.verify_start('any')
+
+        with self.assertFprintError('AlreadyInUse'):
+            self.device.PasswordAccepted('(s)', 'testuser')
+
+        self.device.VerifyStop()
 
     def test_enroll_finger_status(self):
         self.assertFalse(self.finger_present)

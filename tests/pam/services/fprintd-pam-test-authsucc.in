@@ -1,0 +1,4 @@
+# authsucc returns PAM_IGNORE, which jumps over pam_deny: any other result fails the stack
+auth   [ignore=1 default=die]  @FPRINTDPAMPATH@ debug authsucc
+auth   requisite               pam_deny.so
+auth   required                pam_permit.so

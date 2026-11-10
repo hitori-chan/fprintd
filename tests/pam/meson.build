@@ -63,9 +63,21 @@ if installed_tests and tests.length() > 0
         'G_DEBUG=fatal-warnings',
     ]
 
+    pam_service_file_authsucc_installed = configure_file(
+        input: 'services/fprintd-pam-test-authsucc.in',
+        output: 'fprintd-pam-test-authsucc',
+        configuration: configuration_data({
+            'FPRINTDPAMPATH': pam_modules_dir / 'pam_fprintd.so',
+        }),
+    )
+
     pam_tests_installed_data = [
         {
             'file': pam_service_file_installed,
+            'dir': installed_tests_testdir / 'tests' / 'pam' / 'services',
+        },
+        {
+            'file': pam_service_file_authsucc_installed,
             'dir': installed_tests_testdir / 'tests' / 'pam' / 'services',
         },
     ]

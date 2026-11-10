@@ -69,6 +69,7 @@ typedef enum {
   ACTION_OPEN,
   ACTION_CLOSE,
   ACTION_DELETE,
+  ACTION_PASSWORD,
 } FprintDeviceAction;
 
 typedef enum {
@@ -76,6 +77,8 @@ typedef enum {
   STATE_UNCLAIMED,
   STATE_AUTO_CLAIM,
   STATE_ANYTIME,
+  /* unclaimed, or claimed by a connection of the caller's own process */
+  STATE_UNCLAIMED_OR_OWN,
 } FprintDeviceClaimState;
 
 typedef struct
@@ -706,6 +709,10 @@ get_permissions_for_invocation (GDBusMethodInvocation *invocation)
     {
       required_perms |= FPRINT_DEVICE_PERMISSION_VERIFY;
     }
+  else if (g_str_equal (method_name, "PasswordAccepted"))
+    {
+      required_perms |= FPRINT_DEVICE_PERMISSION_VERIFY;
+    }
   else if (g_str_equal (method_name, "Release"))
     {
     }
@@ -740,8 +747,53 @@ get_claim_state_for_invocation (GDBusMethodInvocation *invocation)
     return STATE_AUTO_CLAIM;
   else if (g_str_equal (method_name, "ListEnrolledFingers"))
     return STATE_ANYTIME;
+  else if (g_str_equal (method_name, "PasswordAccepted"))
+    return STATE_UNCLAIMED_OR_OWN;
 
   return STATE_CLAIMED;
+}
+
+static guint32
+get_connection_pid (GDBusConnection *connection,
+                    const char      *name)
+{
+  g_autoptr(GVariant) ret = NULL;
+  guint32 pid = 0;
+
+  ret = g_dbus_connection_call_sync (connection,
+                                     "org.freedesktop.DBus",
+                                     "/org/freedesktop/DBus",
+                                     "org.freedesktop.DBus",
+                                     "GetConnectionUnixProcessID",
+                                     g_variant_new ("(s)", name),
+                                     G_VARIANT_TYPE ("(u)"),
+                                     G_DBUS_CALL_FLAGS_NONE, -1,
+                                     NULL, NULL);
+  if (ret)
+    g_variant_get (ret, "(u)", &pid);
+
+  return pid;
+}
+
+/* A lock screen's PAM module and its own fingerprint client are two
+ * connections of one process: the module may then use the claimed device */
+static gboolean
+is_same_process (GDBusMethodInvocation *invocation,
+                 const char            *other)
+{
+  GDBusConnection *connection;
+  const char *sender;
+  guint32 pid;
+
+  connection = g_dbus_method_invocation_get_connection (invocation);
+  sender = g_dbus_method_invocation_get_sender (invocation);
+
+  if (g_str_equal (sender, other))
+    return TRUE;
+
+  pid = get_connection_pid (connection, sender);
+
+  return pid != 0 && pid == get_connection_pid (connection, other);
 }
 
 static gboolean
@@ -763,6 +815,18 @@ _fprint_device_check_claimed (FprintDevice          *rdev,
   session = session_data_get (priv);
   if (requested_state == STATE_AUTO_CLAIM)
     requested_state = session ? STATE_CLAIMED : STATE_UNCLAIMED;
+
+  if (requested_state == STATE_UNCLAIMED_OR_OWN)
+    {
+      if (!session ||
+          (session->invocation == NULL &&
+           is_same_process (invocation, session->sender)))
+        return TRUE;
+
+      g_set_error (error, FPRINT_ERROR, FPRINT_ERROR_ALREADY_IN_USE,
+                   _("Device already in use by another user"));
+      return FALSE;
+    }
 
   if (requested_state == STATE_UNCLAIMED)
     {
@@ -1451,6 +1515,12 @@ can_start_action (FprintDevice *rdev, GError **error)
       g_set_error (error,
                    FPRINT_ERROR, FPRINT_ERROR_ALREADY_IN_USE,
                    "Delete already in progress");
+      break;
+
+    case ACTION_PASSWORD:
+      g_set_error (error,
+                   FPRINT_ERROR, FPRINT_ERROR_ALREADY_IN_USE,
+                   "Password acceptance already in progress");
       break;
 
     default:             /* Fallback only. */
@@ -2741,6 +2811,81 @@ fprint_device_delete_enrolled_finger (FprintDBusDevice      *dbus_dev,
   return TRUE;
 }
 
+/* The host accepted the user's password: a driver whose device keeps a
+ * lockout of failed matches (apple_sep) clears it. Other drivers have
+ * nothing to do. */
+static gboolean
+fprint_device_password_accepted (FprintDBusDevice      *dbus_dev,
+                                 GDBusMethodInvocation *invocation,
+                                 const char            *username)
+{
+  FprintDevice *rdev = FPRINT_DEVICE (dbus_dev);
+  FprintDevicePrivate *priv = fprint_device_get_instance_private (rdev);
+
+  g_autoptr(FprintDeviceActionUnset) action_unset = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autofree char *user = NULL;
+  gboolean opened = FALSE;
+  gboolean done = FALSE;
+
+  if (!_fprint_device_check_claimed (rdev, invocation, &error) ||
+      !can_start_action (rdev, &error))
+    {
+      g_dbus_method_invocation_return_gerror (invocation, error);
+      return TRUE;
+    }
+
+  user = g_object_steal_qdata (G_OBJECT (invocation), quark_auth_user);
+  g_assert (user);
+  g_assert (g_str_equal (username, "") || g_str_equal (user, username));
+
+  /* An action signal of the driver's own: no libfprint API for it */
+  if (!g_signal_lookup ("password-accepted", G_OBJECT_TYPE (priv->dev)))
+    {
+      g_debug ("Password accepted for user %s: nothing to do on device %d",
+               user, priv->id);
+      fprint_dbus_device_complete_password_accepted (dbus_dev, invocation);
+      return TRUE;
+    }
+
+  priv->current_action = ACTION_PASSWORD;
+  action_unset = rdev;
+
+  if (!fp_device_is_open (priv->dev))
+    {
+      if (!fp_device_open_sync (priv->dev, NULL, &error))
+        {
+          g_dbus_method_invocation_return_error (invocation,
+                                                 FPRINT_ERROR,
+                                                 FPRINT_ERROR_INTERNAL,
+                                                 "Open failed with error: %s",
+                                                 error->message);
+          return TRUE;
+        }
+      opened = TRUE;
+    }
+
+  g_debug ("Password accepted for user %s: telling device %d",
+           user, priv->id);
+  g_signal_emit_by_name (priv->dev, "password-accepted", user, &done);
+
+  if (opened && !fp_device_close_sync (priv->dev, NULL, &error))
+    g_warning ("Error closing the device after the password's acceptance: %s",
+               error->message);
+
+  if (!done)
+    {
+      g_dbus_method_invocation_return_error_literal (invocation,
+                                                     FPRINT_ERROR,
+                                                     FPRINT_ERROR_INTERNAL,
+                                                     "The device did not take the password's acceptance");
+      return TRUE;
+    }
+
+  fprint_dbus_device_complete_password_accepted (dbus_dev, invocation);
+  return TRUE;
+}
+
 static gboolean
 handle_unauthorized_access (FprintDevice          *rdev,
                             GDBusMethodInvocation *invocation,
@@ -2786,6 +2931,8 @@ action_authorization_handler (GDBusInterfaceSkeleton *interface,
     needs_user_auth = TRUE;
   else if (g_str_equal (method_name, "ListEnrolledFingers"))
     needs_user_auth = TRUE;
+  else if (g_str_equal (method_name, "PasswordAccepted"))
+    needs_user_auth = TRUE;
 
   /* This is just a quick check in order to avoid authentication if
    * the user cannot make the call at this time anyway.
@@ -2824,6 +2971,7 @@ fprint_device_dbus_skeleton_iface_init (FprintDBusDeviceIface *iface)
   iface->handle_enroll_start = fprint_device_enroll_start;
   iface->handle_enroll_stop = fprint_device_enroll_stop;
   iface->handle_list_enrolled_fingers = fprint_device_list_enrolled_fingers;
+  iface->handle_password_accepted = fprint_device_password_accepted;
   iface->handle_release = fprint_device_release;
   iface->handle_verify_start = fprint_device_verify_start;
   iface->handle_verify_stop = fprint_device_verify_stop;

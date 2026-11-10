@@ -87,6 +87,7 @@
 #define MAX_TRIES_MATCH "max-tries="
 #define TIMEOUT_MATCH "timeout="
 #define CONCURRENT_MATCH "concurrent"
+#define AUTHSUCC_MATCH "authsucc"
 
 static bool debug = false;
 static unsigned max_tries = DEFAULT_MAX_TRIES;
@@ -105,6 +106,9 @@ static __thread char conv_note[160];
 #define USEC_PER_SEC ((uint64_t) 1000000ULL)
 #define NSEC_PER_USEC ((uint64_t) 1000ULL)
 #define USEC_PER_MSEC ((uint64_t) 1000ULL)
+
+/* authsucc: each call's bound, so that a slow or absent fprintd never holds up the login it follows */
+#define AUTHSUCC_TIMEOUT_USEC (2 * USEC_PER_SEC)
 
 static size_t user_enrolled_prints_num (pam_handle_t *pamh,
                                         sd_bus       *bus,
@@ -1148,6 +1152,73 @@ do_auth (pam_handle_t *pamh, const char *username)
   return PAM_AUTHINFO_UNAVAIL;
 }
 
+/* a call to fprintd bounded by AUTHSUCC_TIMEOUT_USEC; a string argument or none */
+static int
+call_bounded (sd_bus          *bus,
+              const char      *path,
+              const char      *interface,
+              const char      *member,
+              const char      *arg,
+              sd_bus_error    *error,
+              sd_bus_message **reply)
+{
+  pf_autoptr (sd_bus_message) m = NULL;
+  int r;
+
+  r = sd_bus_message_new_method_call (bus, &m, "net.reactivated.Fprint", path, interface, member);
+  if (r >= 0 && arg)
+    r = sd_bus_message_append (m, "s", arg);
+  if (r < 0)
+    return r;
+  return sd_bus_call (bus, m, AUTHSUCC_TIMEOUT_USEC, error, reply);
+}
+
+/*
+ * authsucc, after the password modules succeeded (pam_faillock's idiom): no verify and no prompt; every device hears
+ * that the user's password was accepted (Device.PasswordAccepted). One that locks the user's matches out after too
+ * many failed ones clears that lockout, as the password does on macOS (Touch ID through the SEP). Every error is
+ * ignored: the result is always PAM_IGNORE.
+ */
+static int
+do_password_accepted (pam_handle_t *pamh, const char *username)
+{
+  pf_auto (sd_bus_error) error = SD_BUS_ERROR_NULL;
+  pf_autoptr (sd_bus_message) m = NULL;
+  pf_autoptr (sd_bus) bus = NULL;
+  const char *path;
+  int r;
+
+  if (sd_bus_open_system (&bus) < 0)
+    {
+      pam_syslog (pamh, LOG_ERR, "Error with getting the bus: %d", errno);
+      return PAM_IGNORE;
+    }
+
+  r = call_bounded (bus, "/net/reactivated/Fprint/Manager", "net.reactivated.Fprint.Manager", "GetDevices", NULL,
+                    &error, &m);
+  if (r < 0)
+    {
+      if (debug)
+        pam_syslog (pamh, LOG_DEBUG, "GetDevices failed: %s", error.message ? error.message : strerror (-r));
+      return PAM_IGNORE;
+    }
+
+  if (sd_bus_message_enter_container (m, 'a', "o") < 0)
+    return PAM_IGNORE;
+
+  while (sd_bus_message_read_basic (m, 'o', &path) > 0)
+    {
+      pf_auto (sd_bus_error) e = SD_BUS_ERROR_NULL;
+
+      r = call_bounded (bus, path, "net.reactivated.Fprint.Device", "PasswordAccepted", username, &e, NULL);
+      if (debug)
+        pam_syslog (pamh, LOG_DEBUG, "PasswordAccepted for %s on %s: %s", username, path,
+                    r < 0 ? (e.message ? e.message : strerror (-r)) : "done");
+    }
+
+  return PAM_IGNORE;
+}
+
 static bool
 is_remote (pam_handle_t *pamh)
 {
@@ -1176,16 +1247,12 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc,
                      const char **argv)
 {
   const char *username;
+  /* the handle's own option, not a static one: the module's statics live on across the stack's lines */
+  bool authsucc = false;
   int i;
 
   bindtextdomain (GETTEXT_PACKAGE, LOCALEDIR);
   bind_textdomain_codeset (GETTEXT_PACKAGE, "UTF-8");
-
-  if (is_remote (pamh))
-    return PAM_AUTHINFO_UNAVAIL;
-
-  if (pam_get_user (pamh, &username, NULL) != PAM_SUCCESS)
-    return PAM_AUTHINFO_UNAVAIL;
 
   for (i = 0; i < argc; i++)
     {
@@ -1224,6 +1291,10 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc,
             {
               concurrent = true;
             }
+          else if (str_equal (argv[i], AUTHSUCC_MATCH))
+            {
+              authsucc = true;
+            }
           else if (str_has_prefix (argv[i], MAX_TRIES_MATCH) && strlen (argv[i]) > strlen (MAX_TRIES_MATCH))
             {
               int opt_max_tries = atoi (argv[i] + strlen (MAX_TRIES_MATCH));
@@ -1256,6 +1327,23 @@ pam_sm_authenticate (pam_handle_t *pamh, int flags, int argc,
             }
         }
     }
+
+  if (authsucc)
+    {
+      /* the user the password modules authenticated; never a prompt for one. A remote login's password does not
+       * clear the local sensor's lockout. */
+      if (is_remote (pamh) ||
+          pam_get_item (pamh, PAM_USER, (const void **) (const void *) &username) != PAM_SUCCESS ||
+          !username || !*username)
+        return PAM_IGNORE;
+      return do_password_accepted (pamh, username);
+    }
+
+  if (is_remote (pamh))
+    return PAM_AUTHINFO_UNAVAIL;
+
+  if (pam_get_user (pamh, &username, NULL) != PAM_SUCCESS)
+    return PAM_AUTHINFO_UNAVAIL;
 
   return do_auth (pamh, username);
 }
