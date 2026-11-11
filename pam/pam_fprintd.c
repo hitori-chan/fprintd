@@ -95,12 +95,16 @@ static unsigned timeout = DEFAULT_TIMEOUT;
 static bool concurrent = false;
 
 /* The concurrent mode's verify thread: the application's conversation belongs to the password prompt, which the
- * main thread holds with no text of its own. The prompt is one line on the session's terminal, redrawn in place:
- * "Password: ", "Fingerprint or password: " while the sensor waits for a finger (fprintd's finger-needed), the last
- * message (a no-match, a retry) before it. Other messages are only logged. */
+ * main thread holds with no text of its own. The prompt is one line on the session's terminal, drawn once its state
+ * is known and redrawn in place: "Fingerprint or password: " while the sensor waits for a finger (fprintd's
+ * finger-needed), else "Password: ", the last message (a no-match, a retry, why the finger is not offered) before
+ * it. Until the first of those, or PROMPT_WAIT_USEC, the line stays empty (what is typed meanwhile is kept). Other
+ * messages are only logged. */
 static __thread bool conv_quiet = false;
 static __thread int conv_tty = -1;
 static __thread bool conv_armed = false;
+static __thread bool conv_drawn = false;
+static __thread uint64_t conv_draw_by = 0;
 static __thread char conv_note[160];
 
 #define USEC_PER_SEC ((uint64_t) 1000000ULL)
@@ -109,6 +113,9 @@ static __thread char conv_note[160];
 
 /* authsucc: each call's bound, so that a slow or absent fprintd never holds up the login it follows */
 #define AUTHSUCC_TIMEOUT_USEC (2 * USEC_PER_SEC)
+
+/* concurrent: how long the prompt waits for the sensor before it is drawn as the password's alone */
+#define PROMPT_WAIT_USEC (1 * USEC_PER_SEC)
 
 static size_t user_enrolled_prints_num (pam_handle_t *pamh,
                                         sd_bus       *bus,
@@ -137,6 +144,7 @@ concurrent_redraw (void)
 {
   if (conv_tty < 0)
     return;
+  conv_drawn = true;
   dprintf (conv_tty, "\r\033[K%s%s%s", conv_note, conv_note[0] ? ". " : "",
            conv_armed ? _("Fingerprint or password: ") : _("Password: "));
 }
@@ -699,12 +707,26 @@ do_verify (sd_bus      *bus,
                 }
 
 #if defined(__linux__)
-              r = poll (fds, 3, wait_time == INT64_MAX ? -1 : (int) (wait_time / USEC_PER_MSEC));
+              int64_t poll_time = wait_time;
+
+              /* the concurrent prompt not drawn yet: wake for its deadline */
+              if (conv_tty >= 0 && !conv_drawn)
+                {
+                  int64_t left = (int64_t) conv_draw_by - (int64_t) now ();
+
+                  if (left < 0)
+                    left = 0;
+                  if (left < poll_time)
+                    poll_time = left;
+                }
+              r = poll (fds, 3, poll_time == INT64_MAX ? -1 : (int) ((poll_time + USEC_PER_MSEC - 1) / USEC_PER_MSEC));
               if (r < 0 && errno != EINTR)
                 {
                   pam_syslog (data->pamh, LOG_ERR, "Error waiting for events: %d", errno);
                   return PAM_AUTHINFO_UNAVAIL;
                 }
+              if (conv_tty >= 0 && !conv_drawn && now () >= conv_draw_by && !atomic_load (&data->prompt_done))
+                concurrent_redraw ();
 #else
               if (sd_bus_wait (bus, wait_time) < 0)
                 break;
@@ -966,6 +988,8 @@ verify_thread (void *d)
   conv_quiet = true;
   conv_tty = data->tty_fd;
   conv_armed = false;
+  conv_drawn = false;
+  conv_draw_by = now () + PROMPT_WAIT_USEC;
   concurrent_note (NULL);
   data->thread_ret = do_verify (data->bus, data);
 
@@ -978,7 +1002,7 @@ verify_thread (void *d)
       conv_armed = false;
       if (data->thread_ret == PAM_MAXTRIES)
         concurrent_note (_("No more fingerprint tries"));
-      if (was_armed || data->thread_ret == PAM_MAXTRIES)
+      if (was_armed || !conv_drawn || data->thread_ret == PAM_MAXTRIES)
         concurrent_redraw ();
     }
 
@@ -1010,13 +1034,11 @@ do_concurrent (pam_handle_t *pamh, sd_bus *bus, verify_data *data, int tty_fd)
   data->concurrent = true;
   data->bus = bus;
   data->tty_fd = tty_fd;
-  /* the password's prompt first: the finger is offered once the sensor waits for it */
-  dprintf (tty_fd, "%s", _("Password: "));
+  /* the verify thread draws the prompt once it knows whether the finger is offered */
   data->stop_fd = eventfd (0, EFD_CLOEXEC | EFD_NONBLOCK);
   if (data->stop_fd < 0 || pthread_create (&thread, NULL, verify_thread, data) != 0)
     {
       pam_syslog (pamh, LOG_ERR, "No verify thread (%d): the sequential flow", errno);
-      dprintf (tty_fd, "\r\033[K");
       if (data->stop_fd >= 0)
         close (data->stop_fd);
       data->stop_fd = -1;
