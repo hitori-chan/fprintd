@@ -2908,6 +2908,9 @@ class FPrintdVirtualDeviceVerificationTests(FPrintdVirtualDeviceBaseTest):
     def test_verify_error_removed(self):
         self.assertVerifyError(FPrint.DeviceError.REMOVED, 'verify-disconnected')
 
+    def test_verify_error_password_needed(self):
+        self.assertVerifyError(FPrint.DeviceError.PASSWORD_NEEDED, 'verify-password-needed')
+
     def test_verify_error_data_invalid(self):
         self.assertVerifyError(FPrint.DeviceError.DATA_INVALID, 'verify-unknown-error')
 

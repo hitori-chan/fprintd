@@ -759,6 +759,11 @@ do_verify (sd_bus      *bus,
             {
               return PAM_AUTHINFO_UNAVAIL;
             }
+          else if (str_equal (data->result, "verify-password-needed"))
+            {
+              send_err_msg (data->pamh, _("Your password is required to use your fingerprint"));
+              return PAM_AUTHINFO_UNAVAIL;
+            }
           else
             {
               send_err_msg (data->pamh, _("An unknown error occurred"));
@@ -968,10 +973,13 @@ verify_thread (void *d)
    * first, an error): the prompt goes back to the password's, saying why when the tries ran out */
   if (data->thread_ret != PAM_SUCCESS && !atomic_load (&data->prompt_done))
     {
+      bool was_armed = conv_armed;
+
+      conv_armed = false;
       if (data->thread_ret == PAM_MAXTRIES)
         concurrent_note (_("No more fingerprint tries"));
-      conv_armed = false;
-      concurrent_redraw ();
+      if (was_armed || data->thread_ret == PAM_MAXTRIES)
+        concurrent_redraw ();
     }
 
   /* a match ends the password prompt as Enter would: the application's own read returns, its terminal restored by

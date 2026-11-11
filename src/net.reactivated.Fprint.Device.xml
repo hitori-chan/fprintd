@@ -194,6 +194,12 @@
 						</doc:definition>
 					</doc:item>
 					<doc:item>
+						<doc:term>verify-password-needed</doc:term>
+						<doc:definition>
+							The device matches again only once the user's password has been accepted: after a restart, a long time without the password, or too many failed matches. The verification is over; <doc:ref type="method" to="Device.VerifyStop">Device.VerifyStop</doc:ref> should now be called, and the password asked for.
+						</doc:definition>
+					</doc:item>
+					<doc:item>
 						<doc:term>verify-unknown-error</doc:term>
 						<doc:definition>
 							An unknown error occurred (usually a driver problem), <doc:ref type="method" to="Device.VerifyStop">Device.VerifyStop</doc:ref> should now be called.

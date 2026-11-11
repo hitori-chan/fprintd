@@ -608,6 +608,8 @@ verify_result_to_name (gboolean match, GError *error)
         return "verify-disconnected";
       else if (g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_TOO_HOT))
         return "verify-disconnected";
+      else if (g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_PASSWORD_NEEDED))
+        return "verify-password-needed";
       else if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) ||
                g_error_matches (error, FP_DEVICE_ERROR, FP_DEVICE_ERROR_DATA_NOT_FOUND))
         return "verify-no-match";

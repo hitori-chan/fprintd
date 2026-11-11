@@ -58,6 +58,7 @@ VALID_VERIFY_STATUS = [
     'verify-finger-not-centered',
     'verify-remove-and-retry',
     'verify-disconnected',
+    'verify-password-needed',
     'verify-unknown-error'
 ]
 
