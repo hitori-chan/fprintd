@@ -745,7 +745,20 @@ do_verify (sd_bus      *bus,
       else
         {
           if (str_equal (data->result, "verify-no-match"))
-            send_err_msg (data->pamh, _("Failed to match fingerprint"));
+            {
+              /* Two failures in a row would read the same: say what is left. The last one's
+               * line is the caller's (PAM_MAXTRIES) */
+              unsigned left = data->max_tries - 1;
+              char msg[96];
+
+              if (left == 0 || data->max_tries == UINT_MAX)
+                snprintf (msg, sizeof (msg), "%s", _("Failed to match fingerprint"));
+              else if (left == 1)
+                snprintf (msg, sizeof (msg), "%s", _("Failed to match fingerprint, 1 try left"));
+              else
+                snprintf (msg, sizeof (msg), _("Failed to match fingerprint, %u tries left"), left);
+              send_err_msg (data->pamh, msg);
+            }
           else if (str_equal (data->result, "verify-match"))
             /* Simply disconnect from bus if we return PAM_SUCCESS */
             return PAM_SUCCESS;

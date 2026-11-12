@@ -334,9 +334,9 @@ class TestPamFprintd(dbusmock.DBusTestCase):
 
         self.assertRegex(res.info[0], r'Swipe your left little finger across the fingerprint reader')
         self.assertEqual(len(res.errors), 3)
-        self.assertRegex(res.errors[0], r'Failed to match fingerprint')
-        self.assertRegex(res.errors[1], r'Failed to match fingerprint')
-        self.assertRegex(res.errors[2], r'Failed to match fingerprint')
+        self.assertRegex(res.errors[0], r'Failed to match fingerprint, 2 tries left$')
+        self.assertRegex(res.errors[1], r'Failed to match fingerprint, 1 try left$')
+        self.assertRegex(res.errors[2], r'Failed to match fingerprint$')
 
     def test_pam_already_claimed(self):
         self.setup_device()
